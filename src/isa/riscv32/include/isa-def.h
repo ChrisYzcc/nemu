@@ -23,6 +23,8 @@ typedef struct {
   vaddr_t pc;
   vaddr_t commit_pc;
   word_t mepc, mcause, mstatus, mstvec, mvendorid, marchid;
+  vaddr_t lr_addr;  // for LR/SC instruction
+  word_t lr_valid;
 } MUXDEF(CONFIG_RV64, riscv64_CPU_state, riscv32_CPU_state);
 
 // decode

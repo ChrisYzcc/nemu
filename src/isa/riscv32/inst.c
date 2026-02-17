@@ -13,6 +13,7 @@
 * See the Mulan PSL v2 for more details.
 ***************************************************************************************/
 
+#include "common.h"
 #include "local-include/reg.h"
 #include <cpu/cpu.h>
 #include <cpu/ifetch.h>
@@ -83,7 +84,7 @@ void isa_csr_write(int num, word_t data){
 // imm[12|10:5] [rs2, rs1, funct3] imm[4:1|11], B-Type
 #define immB() do { *imm = (SEXT(BITS(i, 31, 31), 1) << 12) | (BITS(i, 30, 25) << 5) | (BITS(i, 11, 8) << 1) | (BITS(i, 7, 7) << 11);} while(0)
 
-static void decode_operand(Decode *s, int *rd, word_t *src1, word_t *src2, word_t *imm, word_t *shamt, int type) {
+static void decode_operand(Decode *s, int *rd, word_t *src1, word_t *src2, word_t *imm, word_t *shamt, word_t *shamt_w, int type) {
   uint32_t i = s->isa.inst;
   int rs1 = BITS(i, 19, 15);
   int rs2 = BITS(i, 24, 20);
@@ -94,6 +95,8 @@ static void decode_operand(Decode *s, int *rd, word_t *src1, word_t *src2, word_
 #else
   *shamt  = BITS(i, 25, 20);
 #endif
+
+  *shamt_w = BITS(i, 24, 20);
 
   switch (type) {
     case TYPE_I: src1R();          immI(); break;
@@ -111,8 +114,8 @@ static int decode_exec(Decode *s) {
 #define INSTPAT_INST(s) ((s)->isa.inst)
 #define INSTPAT_MATCH(s, name, type, ... /* execute body */ ) { \
   int rd = 0; \
-  word_t src1 = 0, src2 = 0, imm = 0, shamt = 0; \
-  decode_operand(s, &rd, &src1, &src2, &imm, &shamt, concat(TYPE_, type)); \
+  word_t src1 = 0, src2 = 0, imm = 0, shamt = 0, shamt_w = 0; \
+  decode_operand(s, &rd, &src1, &src2, &imm, &shamt, &shamt_w, concat(TYPE_, type)); \
   __VA_ARGS__ ; \
 }
 
@@ -144,9 +147,9 @@ static int decode_exec(Decode *s) {
 #endif
 
   INSTPAT("??????? ????? ????? 000 ????? 00110 11", addiw  , I, {R(rd) = SEXT(BITS(src1 + imm, 31, 0), 32);});
-  INSTPAT("0000000 ????? ????? 001 ????? 00110 11", slliw  , I, {R(rd) = SEXT(BITS(src1 << shamt, 31, 0), 32);});
-  INSTPAT("0000000 ????? ????? 101 ????? 00110 11", srliw  , I, {R(rd) = SEXT(BITS(src1, 31, 0) >> shamt, 32);});
-  INSTPAT("0100000 ????? ????? 101 ????? 00110 11", sraiw  , I, {R(rd) = SEXT((int32_t)BITS(src1, 31, 0) >> shamt, 32);});  
+  INSTPAT("0000000 ????? ????? 001 ????? 00110 11", slliw  , I, {R(rd) = SEXT(BITS(src1 << shamt_w, 31, 0), 32);});
+  INSTPAT("0000000 ????? ????? 101 ????? 00110 11", srliw  , I, {R(rd) = SEXT(BITS(src1, 31, 0) >> shamt_w, 32);});
+  INSTPAT("0100000 ????? ????? 101 ????? 00110 11", sraiw  , I, {R(rd) = SEXT((int32_t)BITS(src1, 31, 0) >> shamt_w, 32);});  
 
   INSTPAT("??????? ????? ????? 110 ????? 00000 11", lwu    , I, {R(rd) = BITS(Mr(src1 + imm, 4), 31, 0);});
   INSTPAT("??????? ????? ????? 011 ????? 00000 11", ld     , I, {R(rd) = Mr(src1 + imm, 8);});
@@ -188,28 +191,270 @@ static int decode_exec(Decode *s) {
   INSTPAT("??????? ????? ????? 111 ????? 11000 11", bgeu   , B, {if (src1 >= src2) s->dnpc = s->pc + imm;});
 
   // RV32M (R-Type)
-  INSTPAT("0000001 ????? ????? 100 ????? 01100 11", div    , R, {R(rd) = (sword_t)src1 / (sword_t)src2;});
+  sword_t neg_most = 0;
+  word_t pos_most = 0;
+#ifdef CONFIG_RV64
+  neg_most = 0x8000000000000000;
+  pos_most = 0xFFFFFFFFFFFFFFFF;
+#else
+  neg_most = 0x80000000;
+  pos_most = 0xFFFFFFFF;
+#endif
+
+  INSTPAT("0000001 ????? ????? 100 ????? 01100 11", div    , R, {
+    if (src2 == 0) {
+      R(rd) = -1;
+    }
+    else {
+      if (src1 == neg_most && src2 == -1) {
+        R(rd) = neg_most;
+      }
+       else {
+        R(rd) = (sword_t)src1 / (sword_t)src2;
+      }
+    }
+  });
+
 #ifndef CONFIG_RV64
   INSTPAT("0000001 ????? ????? 000 ????? 01100 11", mul    , R, {R(rd) = ((int64_t)(sword_t)src1 * (int64_t)(sword_t)src2) & 0xFFFFFFFF;});
 #else
   INSTPAT("0000001 ????? ????? 000 ????? 01100 11", mul    , R, {R(rd) = ((int64_t)(sword_t)src1 * (int64_t)(sword_t)src2);});
 #endif
-  INSTPAT("0000001 ????? ????? 110 ????? 01100 11", rem    , R, {R(rd) = (sword_t)src1 % (sword_t)src2;});
+
+  INSTPAT("0000001 ????? ????? 110 ????? 01100 11", rem    , R, {
+    if (src2 == 0) {
+      R(rd) = src1;
+    }
+    else {
+      if (src1 == neg_most && src2 == -1) {
+        R(rd) = 0;
+      }
+      else {
+        R(rd) = (sword_t)src1 % (sword_t)src2;
+      }
+    }
+  });
+
 #ifndef CONFIG_RV64
   INSTPAT("0000001 ????? ????? 001 ????? 01100 11", mulh   , R, {R(rd) = (((int64_t)(sword_t)src1 * (int64_t)(sword_t)src2) >> 32) & 0xFFFFFFFF;});
 #else
-    INSTPAT("0000001 ????? ????? 001 ????? 01100 11", mulh   , R, {R(rd) = ((__int128)(sword_t)src1 * (__int128)(sword_t)src2) >> 64;});
+  INSTPAT("0000001 ????? ????? 001 ????? 01100 11", mulh   , R, {R(rd) = ((__int128)(sword_t)src1 * (__int128)(sword_t)src2) >> 64;});
 #endif
-  INSTPAT("0000001 ????? ????? 111 ????? 01100 11", remu   , R, {R(rd) = src1 % src2;});
-  INSTPAT("0000001 ????? ????? 101 ????? 01100 11", divu   , R, {R(rd) = src1 / src2;});
+
+#ifndef CONFIG_RV64
+  INSTPAT("0000001 ????? ????? 010 ????? 01100 11", mulhsu , R, {R(rd) = (((int64_t)(sword_t)src1 * (uint64_t)src2) >> 32) & 0xFFFFFFFF;});
+#else
+  INSTPAT("0000001 ????? ????? 010 ????? 01100 11", mulhsu , R, {R(rd) = ((__int128)(sword_t)src1 * (__int128)(word_t)src2) >> 64;});
+#endif
+
+  INSTPAT("0000001 ????? ????? 111 ????? 01100 11", remu   , R, {
+    if (src2 == 0) {
+      R(rd) = src1;
+    }
+    else {
+      R(rd) = src1 % src2;
+    }
+  });
+
+  INSTPAT("0000001 ????? ????? 101 ????? 01100 11", divu   , R, {
+    if (src2 == 0) {
+      R(rd) = pos_most;
+    }
+    else {
+        R(rd) = src1 / src2;
+    }
+  });
+
+#ifndef CONFIG_RV64
   INSTPAT("0000001 ????? ????? 011 ????? 01100 11", mulhu  , R, {R(rd) = ((uint64_t)src1 * (uint64_t)src2) >> 32;});
+#else
+  INSTPAT("0000001 ????? ????? 011 ????? 01100 11", mulhu  , R, {R(rd) = ((__int128)(word_t)src1 * (__int128)(word_t)src2) >> 64;});
+#endif
 
   // RV64M
   INSTPAT("0000001 ????? ????? 000 ????? 01110 11", mulw   , R, {R(rd) = SEXT(BITS((int64_t)(sword_t)src1 * (int64_t)(sword_t)src2, 31, 0), 32);});
-  INSTPAT("0000001 ????? ????? 100 ????? 01110 11", divw   , R, {R(rd) = SEXT((int32_t)BITS(src1, 31, 0) / (int32_t)BITS(src2, 31, 0), 32);});
-  INSTPAT("0000001 ????? ????? 101 ????? 01110 11", divuw  , R, {R(rd) = SEXT((uint32_t)BITS(src1, 31, 0) / (uint32_t)BITS(src2, 31, 0), 32);});
-  INSTPAT("0000001 ????? ????? 110 ????? 01110 11", remw   , R, {R(rd) = SEXT((int32_t)BITS(src1, 31, 0) % (int32_t)BITS(src2, 31, 0), 32);});
-  INSTPAT("0000001 ????? ????? 111 ????? 01110 11", remuw  , R, {R(rd) = SEXT((uint32_t)BITS(src1, 31, 0) % (uint32_t)BITS(src2, 31, 0), 32);});
+
+  INSTPAT("0000001 ????? ????? 100 ????? 01110 11", divw   , R, {
+    int32_t s_src1 = (int32_t)BITS(src1, 31, 0);
+    int32_t s_src2 = (int32_t)BITS(src2, 31, 0);
+
+    if (s_src2 == 0) {
+      R(rd) = -1;
+    }
+    else {
+      if (s_src1 == 0x80000000 && s_src2 == -1) {
+        R(rd) = 0x80000000;
+      }
+      else {
+        R(rd) = SEXT(s_src1 / s_src2, 32);
+      }
+    }
+  });
+
+  INSTPAT("0000001 ????? ????? 101 ????? 01110 11", divuw  , R, {
+    uint32_t u_src1 = (uint32_t)BITS(src1, 31, 0);
+    uint32_t u_src2 = (uint32_t)BITS(src2, 31, 0);
+    if (u_src2 == 0) {
+      R(rd) = pos_most;
+    }
+    else {
+       R(rd) = SEXT(u_src1 / u_src2, 32);
+    }
+  });
+
+  INSTPAT("0000001 ????? ????? 110 ????? 01110 11", remw   , R, {
+    int32_t s_src1 = (int32_t)BITS(src1, 31, 0);
+    int32_t s_src2 = (int32_t)BITS(src2, 31, 0);
+    if (s_src2 == 0) {
+      R(rd) = s_src1;
+    }
+    else {
+      if (s_src1 == 0x80000000 && s_src2 == -1) {
+        R(rd) = 0;
+      }
+      else {
+        R(rd) = SEXT(s_src1 % s_src2, 32);
+      }
+    }
+  });
+
+  INSTPAT("0000001 ????? ????? 111 ????? 01110 11", remuw  , R, {
+    uint32_t u_src1 = (uint32_t)BITS(src1, 31, 0);
+    uint32_t u_src2 = (uint32_t)BITS(src2, 31, 0);
+    if (u_src2 == 0) {
+      R(rd) = SEXT(u_src1, 32);
+    }
+    else {
+      R(rd) = SEXT(u_src1 % u_src2, 32);
+    }
+  });
+
+  // fence
+  INSTPAT("0000??? ????? 00000 000 00000 00011 11", fence  , I, {;});
+
+  // RV32A
+  INSTPAT("00010?? 00000 ????? 010 ????? 01011 11", lr_w   , R, {
+    cpu.lr_valid = 1;
+    cpu.lr_addr = src1;
+    R(rd) = SEXT(Mr(src1, 4), 32);
+  });
+  INSTPAT("00011?? 00000 ????? 010 ????? 01011 11", sc_w   , R, {
+    if (cpu.lr_valid && cpu.lr_addr == src1) {
+      Mw(src1, 4, src2);
+      R(rd) = 0;
+    }
+    else {
+      R(rd) = 1;
+    }
+    cpu.lr_valid = 0;
+  });
+
+  INSTPAT("00001?? ????? ????? 010 ????? 01011 11", amoswap_w, R, {
+    R(rd) = SEXT(Mr(src1, 4), 32);
+    Mw(src1, 4, BITS(src2, 31, 0));
+  });
+
+  INSTPAT("00000?? ????? ????? 010 ????? 01011 11", amoadd_w , R, {
+    R(rd) = SEXT(Mr(src1, 4), 32);
+    Mw(src1, 4, R(rd) + BITS(src2, 31, 0));
+  });
+
+  INSTPAT("00100?? ????? ????? 010 ????? 01011 11", amoxor_w , R, {
+    R(rd) = SEXT(Mr(src1, 4), 32);
+    Mw(src1, 4, R(rd) ^ BITS(src2, 31, 0));
+  });
+
+  INSTPAT("01100?? ????? ????? 010 ????? 01011 11", amoand_w , R, {
+    R(rd) = SEXT(Mr(src1, 4), 32);
+    Mw(src1, 4, R(rd) & BITS(src2, 31, 0));
+  });
+
+  INSTPAT("01000?? ????? ????? 010 ????? 01011 11", amoor_w  , R, {
+    R(rd) = SEXT(Mr(src1, 4), 32);
+    Mw(src1, 4, R(rd) | BITS(src2, 31, 0));
+  });
+
+  INSTPAT("10000?? ????? ????? 010 ????? 01011 11", amomin_w , R, {
+    R(rd) = SEXT(Mr(src1, 4), 32);
+    Mw(src1, 4, ((sword_t)R(rd) < SEXT(BITS(src2, 31, 0), 32)) ? R(rd) : BITS(src2, 31, 0));
+  });
+
+  INSTPAT("10100?? ????? ????? 010 ????? 01011 11", amomax_w , R, {
+    R(rd) = SEXT(Mr(src1, 4), 32);
+    Mw(src1, 4, ((sword_t)R(rd) > SEXT(BITS(src2, 31, 0), 32)) ? R(rd) : BITS(src2, 31, 0));
+  });
+
+  INSTPAT("11000?? ????? ????? 010 ????? 01011 11", amominu_w, R, {
+    R(rd) = SEXT(Mr(src1, 4), 32);
+    Mw(src1, 4, (R(rd) < (word_t)BITS(src2, 31, 0)) ? R(rd) : BITS(src2, 31, 0));
+  });
+
+  INSTPAT("11100?? ????? ????? 010 ????? 01011 11", amomaxu_w, R, {
+    R(rd) = SEXT(Mr(src1, 4), 32);
+    Mw(src1, 4, (R(rd) > (word_t)BITS(src2, 31, 0)) ? R(rd) : BITS(src2, 31, 0));
+  });
+
+  INSTPAT("00010?? ????? ????? 011 ????? 01011 11", lr_d   , R, {
+    cpu.lr_valid = 1;
+    cpu.lr_addr = src1;
+    R(rd) = Mr(src1, 8);
+  });
+
+  INSTPAT("00011?? ????? ????? 011 ????? 01011 11", sc_d   , R, {
+    if (cpu.lr_valid && cpu.lr_addr == src1) {
+      Mw(src1, 8, src2);
+      R(rd) = 0;
+    }
+    else {
+      R(rd) = 1;
+    }
+    cpu.lr_valid = 0;
+  });
+
+  INSTPAT("00001?? ????? ????? 011 ????? 01011 11", amoswap_d, R, {
+    R(rd) = Mr(src1, 8);
+    Mw(src1, 8, src2);
+  });
+
+  INSTPAT("00000?? ????? ????? 011 ????? 01011 11", amoadd_d , R, {
+    R(rd) = Mr(src1, 8);
+    Mw(src1, 8, R(rd) + src2);
+  });
+
+  INSTPAT("00100?? ????? ????? 011 ????? 01011 11", amoxor_d , R, {
+    R(rd) = Mr(src1, 8);
+    Mw(src1, 8, R(rd) ^ src2);
+  });
+
+  INSTPAT("01100?? ????? ????? 011 ????? 01011 11", amoand_d , R, {
+    R(rd) = Mr(src1, 8);
+    Mw(src1, 8, R(rd) & src2);
+  });
+
+  INSTPAT("01000?? ????? ????? 011 ????? 01011 11", amoor_d  , R, {
+    R(rd) = Mr(src1, 8);
+    Mw(src1, 8, R(rd) | src2);
+  });
+
+  INSTPAT("10000?? ????? ????? 011 ????? 01011 11", amomin_d , R, {
+    R(rd) = Mr(src1, 8);
+    Mw(src1, 8, ((sword_t)R(rd) < (sword_t)src2) ? R(rd) : src2);
+  });
+
+  INSTPAT("10100?? ????? ????? 011 ????? 01011 11", amomax_d , R, {
+    R(rd) = Mr(src1, 8);
+    Mw(src1, 8, ((sword_t)R(rd) > (sword_t)src2) ? R(rd) : src2);
+  });
+
+  INSTPAT("11000?? ????? ????? 011 ????? 01011 11", amominu_d, R, {
+    R(rd) = Mr(src1, 8);
+    Mw(src1, 8, (R(rd) < src2) ? R(rd) : src2);
+  });
+
+  INSTPAT("11100?? ????? ????? 011 ????? 01011 11", amomaxu_d, R, {
+    R(rd) = Mr(src1, 8);
+    Mw(src1, 8, (R(rd) > src2) ? R(rd) : src2);
+  });
 
   // CSR
   INSTPAT("??????? ????? ????? 001 ????? 11100 11", csrrw  , I, {R(rd) = isa_csr_read(imm & 0xfff); isa_csr_write(imm & 0xfff, src1);});
